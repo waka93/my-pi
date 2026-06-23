@@ -117,6 +117,7 @@ export interface Settings {
 	markdown?: MarkdownSettings;
 	warnings?: WarningSettings;
 	sessionDir?: string; // Custom session storage directory (same format as --session-dir CLI flag)
+	memoryProvider?: "default" | "memfs"; // Session storage backend: "default" (JSONL) or "memfs" (Letta MemFS, directory per session)
 	httpProxy?: string; // Proxy URL applied as HTTP_PROXY and HTTPS_PROXY for Pi-managed HTTP clients
 	httpIdleTimeoutMs?: number; // HTTP header/body idle timeout in milliseconds; 0 disables it
 	websocketConnectTimeoutMs?: number; // WebSocket connect/open handshake timeout in milliseconds; 0 disables it
@@ -664,6 +665,10 @@ export class SettingsManager {
 	getSessionDir(): string | undefined {
 		const sessionDir = this.settings.sessionDir;
 		return sessionDir ? normalizePath(sessionDir) : sessionDir;
+	}
+
+	getMemoryProvider(): "default" | "memfs" | undefined {
+		return this.settings.memoryProvider;
 	}
 
 	getDefaultProvider(): string | undefined {

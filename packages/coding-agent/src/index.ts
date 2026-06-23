@@ -210,6 +210,7 @@ export {
 	CURRENT_SESSION_VERSION,
 	type CustomEntry,
 	type CustomMessageEntry,
+	configureMemoryProvider,
 	type FileEntry,
 	getLatestCompactionEntry,
 	type ModelChangeEntry,
@@ -224,6 +225,7 @@ export {
 	type SessionInfoEntry,
 	SessionManager,
 	type SessionMessageEntry,
+	type SessionPersistence,
 	type ThinkingLevelChangeEntry,
 } from "./core/session-manager.ts";
 export {

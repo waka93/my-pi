@@ -38,7 +38,7 @@ import {
 	MissingSessionCwdError,
 	type SessionCwdIssue,
 } from "./core/session-cwd.ts";
-import { assertValidSessionId, SessionManager } from "./core/session-manager.ts";
+import { assertValidSessionId, configureMemoryProvider, SessionManager } from "./core/session-manager.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
@@ -540,6 +540,16 @@ export async function main(args: string[], options?: MainOptions) {
 
 	const startupSettingsManager = SettingsManager.create(cwd, agentDir);
 	reportDiagnostics(collectSettingsDiagnostics(startupSettingsManager, "startup session lookup"));
+
+	// Configure memory provider: MEMORY_PROVIDER env var > settings.memoryProvider > "default".
+	// The env var is also read at module load in session-manager.ts, but the settings value
+	// requires the SettingsManager to be initialized first, so we re-apply here if needed.
+	{
+		const settingsProvider = startupSettingsManager.getMemoryProvider();
+		if (settingsProvider && !process.env["MEMORY_PROVIDER"]) {
+			configureMemoryProvider(settingsProvider);
+		}
+	}
 
 	// Experimental first-time setup: theme choice and analytics opt-in.
 	// Runs before any runtime services are created so the chosen settings apply everywhere.

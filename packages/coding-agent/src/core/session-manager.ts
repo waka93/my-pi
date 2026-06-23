@@ -9,8 +9,10 @@ import {
 	mkdirSync,
 	openSync,
 	readdirSync,
+	readFileSync,
 	readSync,
 	statSync,
+	unlinkSync,
 	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
@@ -744,6 +746,461 @@ async function listSessionsFromDir(
 	return sessions;
 }
 
+// =========================================================================
+// Session Persistence Layer
+// =========================================================================
+
+/**
+ * Abstracts all session storage I/O. Implementations determine the on-disk format.
+ * Configure the active provider with configureMemoryProvider().
+ */
+export interface SessionPersistence {
+	/** Write all entries to a new session location (called on first assistant message). */
+	flush(sessionPath: string, allEntries: FileEntry[]): void;
+	/** Append a single new entry to an existing session. */
+	append(sessionPath: string, entry: SessionEntry): void;
+	/** Completely overwrite a session (used after migration or branch creation). */
+	rewrite(sessionPath: string, allEntries: FileEntry[]): void;
+	/** Load all entries from a session location. Returns [] if missing or corrupted. */
+	load(sessionPath: string): FileEntry[];
+	/** Check if a session location exists and is valid. */
+	exists(sessionPath: string): boolean;
+	/** Create a directory (and any parents) if it does not already exist. */
+	ensureDir(path: string): void;
+	/** Generate a path/identifier for a new session within sessionDir. */
+	generatePath(sessionDir: string, sessionId: string, timestamp: string): string;
+	/** Find the most recently modified session in sessionDir matching optional cwd. Returns path or null. */
+	findMostRecent(sessionDir: string, cwd?: string): string | null;
+	/** List all sessions in a directory. */
+	listSessions(sessionDir: string, onProgress?: SessionListProgress): Promise<SessionInfo[]>;
+	/** List all sessions across all cwd-encoded subdirectories under baseDir. */
+	listAllSessions(baseDir: string, onProgress?: SessionListProgress): Promise<SessionInfo[]>;
+}
+
+/** Default provider: append-only JSONL files, one file per session. */
+class JsonlSessionPersistence implements SessionPersistence {
+	flush(sessionPath: string, allEntries: FileEntry[]): void {
+		const fd = openSync(sessionPath, "wx");
+		try {
+			for (const entry of allEntries) {
+				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+			}
+		} finally {
+			closeSync(fd);
+		}
+	}
+
+	append(sessionPath: string, entry: SessionEntry): void {
+		appendFileSync(sessionPath, `${JSON.stringify(entry)}\n`);
+	}
+
+	rewrite(sessionPath: string, allEntries: FileEntry[]): void {
+		const fd = openSync(sessionPath, "w");
+		try {
+			for (const entry of allEntries) {
+				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+			}
+		} finally {
+			closeSync(fd);
+		}
+	}
+
+	load(sessionPath: string): FileEntry[] {
+		return loadEntriesFromFile(sessionPath);
+	}
+
+	exists(sessionPath: string): boolean {
+		return existsSync(sessionPath);
+	}
+
+	ensureDir(path: string): void {
+		if (!existsSync(path)) {
+			mkdirSync(path, { recursive: true });
+		}
+	}
+
+	generatePath(sessionDir: string, sessionId: string, timestamp: string): string {
+		const fileTimestamp = timestamp.replace(/[:.]/g, "-");
+		return join(sessionDir, `${fileTimestamp}_${sessionId}.jsonl`);
+	}
+
+	findMostRecent(sessionDir: string, cwd?: string): string | null {
+		return findMostRecentSession(sessionDir, cwd);
+	}
+
+	async listSessions(sessionDir: string, onProgress?: SessionListProgress): Promise<SessionInfo[]> {
+		return listSessionsFromDir(sessionDir, onProgress);
+	}
+
+	async listAllSessions(baseDir: string, onProgress?: SessionListProgress): Promise<SessionInfo[]> {
+		try {
+			if (!existsSync(baseDir)) return [];
+			const dirs = (await readdir(baseDir, { withFileTypes: true }))
+				.filter((e) => e.isDirectory())
+				.map((e) => join(baseDir, e.name));
+
+			let totalFiles = 0;
+			const dirFiles: string[][] = [];
+			for (const dir of dirs) {
+				try {
+					const files = (await readdir(dir)).filter((f) => f.endsWith(".jsonl"));
+					dirFiles.push(files.map((f) => join(dir, f)));
+					totalFiles += files.length;
+				} catch {
+					dirFiles.push([]);
+				}
+			}
+
+			let loaded = 0;
+			const sessions: SessionInfo[] = [];
+			const allFiles = dirFiles.flat();
+			const results = await buildSessionInfosWithConcurrency(allFiles, () => {
+				loaded++;
+				onProgress?.(loaded, totalFiles);
+			});
+			for (const info of results) {
+				if (info) sessions.push(info);
+			}
+			return sessions;
+		} catch {
+			return [];
+		}
+	}
+}
+
+// =========================================================================
+// Letta MemFS Provider
+// =========================================================================
+
+/**
+ * Letta MemFS-inspired provider: one directory per session, one JSON file per entry.
+ *
+ * Session directory layout:
+ *   {sessionDir}/{sessionId}/
+ *     manifest.json          # header + ordered entry IDs + current leafId
+ *     entries/{id}.json      # one file per session entry
+ *
+ * Unlike the default append-only JSONL, individual entries are addressable files
+ * that can be independently updated or removed. Switching providers does not
+ * migrate existing sessions — each provider reads only its own format.
+ */
+interface MemfsManifest {
+	version: 1;
+	header: SessionHeader;
+	leafId: string | null;
+	entryIds: string[];
+}
+
+async function buildMemfsSessionInfo(sessionPath: string): Promise<SessionInfo | null> {
+	try {
+		const manifestPath = join(sessionPath, "manifest.json");
+		const manifestStat = await stat(manifestPath);
+		const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as MemfsManifest;
+		if (!manifest.header?.id) return null;
+
+		const header = manifest.header;
+		const entriesDir = join(sessionPath, "entries");
+
+		let messageCount = 0;
+		let firstMessage = "";
+		const allMessages: string[] = [];
+		let name: string | undefined;
+		let lastActivityTime: number | undefined;
+
+		for (const id of manifest.entryIds) {
+			const entryPath = join(entriesDir, `${id}.json`);
+			try {
+				if (!existsSync(entryPath)) continue;
+				const entry = JSON.parse(readFileSync(entryPath, "utf8")) as SessionEntry;
+				if (entry.type === "session_info") {
+					name = (entry as SessionInfoEntry).name?.trim() || undefined;
+				}
+				if (entry.type !== "message") continue;
+				messageCount++;
+				const msgEntry = entry as SessionMessageEntry;
+				const message = msgEntry.message;
+				if (!isMessageWithContent(message)) continue;
+				if (message.role !== "user" && message.role !== "assistant") continue;
+				const textContent = extractTextContent(message);
+				if (!textContent) continue;
+				allMessages.push(textContent);
+				if (!firstMessage && message.role === "user") firstMessage = textContent;
+				const activityTime = getMessageActivityTime(msgEntry);
+				if (typeof activityTime === "number") {
+					lastActivityTime = Math.max(lastActivityTime ?? 0, activityTime);
+				}
+			} catch {
+				// skip corrupted entries
+			}
+		}
+
+		const headerTime = new Date(header.timestamp).getTime();
+		const modified =
+			typeof lastActivityTime === "number" && lastActivityTime > 0
+				? new Date(lastActivityTime)
+				: !Number.isNaN(headerTime)
+					? new Date(headerTime)
+					: manifestStat.mtime;
+
+		return {
+			path: sessionPath,
+			id: header.id,
+			cwd: typeof header.cwd === "string" ? header.cwd : "",
+			name,
+			parentSessionPath: header.parentSession,
+			created: new Date(header.timestamp),
+			modified,
+			messageCount,
+			firstMessage: firstMessage || "(no messages)",
+			allMessagesText: allMessages.join(" "),
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function buildMemfsSessionInfosWithConcurrency(
+	sessionDirs: string[],
+	onLoaded: () => void,
+): Promise<(SessionInfo | null)[]> {
+	const results: (SessionInfo | null)[] = new Array(sessionDirs.length).fill(null);
+	const inFlight = new Set<Promise<void>>();
+	let nextIndex = 0;
+
+	const startNext = (): void => {
+		const index = nextIndex++;
+		const dir = sessionDirs[index];
+		if (!dir) return;
+		let task: Promise<void>;
+		task = buildMemfsSessionInfo(dir)
+			.then((info) => {
+				results[index] = info;
+			})
+			.catch(() => {
+				results[index] = null;
+			})
+			.finally(() => {
+				inFlight.delete(task);
+				onLoaded();
+			});
+		inFlight.add(task);
+	};
+
+	while (nextIndex < sessionDirs.length || inFlight.size > 0) {
+		while (nextIndex < sessionDirs.length && inFlight.size < MAX_CONCURRENT_SESSION_INFO_LOADS) {
+			startNext();
+		}
+		if (inFlight.size > 0) {
+			await Promise.race(inFlight);
+		}
+	}
+
+	return results;
+}
+
+class MemfsSessionPersistence implements SessionPersistence {
+	private writeManifest(sessionPath: string, manifest: MemfsManifest): void {
+		writeFileSync(join(sessionPath, "manifest.json"), JSON.stringify(manifest));
+	}
+
+	private readManifest(sessionPath: string): MemfsManifest {
+		return JSON.parse(readFileSync(join(sessionPath, "manifest.json"), "utf8")) as MemfsManifest;
+	}
+
+	flush(sessionPath: string, allEntries: FileEntry[]): void {
+		const entriesDir = join(sessionPath, "entries");
+		mkdirSync(entriesDir, { recursive: true });
+		const header = allEntries.find((e): e is SessionHeader => e.type === "session");
+		const entries = allEntries.filter((e): e is SessionEntry => e.type !== "session");
+		for (const entry of entries) {
+			writeFileSync(join(entriesDir, `${entry.id}.json`), JSON.stringify(entry));
+		}
+		const manifest: MemfsManifest = {
+			version: 1,
+			header: header ?? { type: "session", id: "", timestamp: new Date().toISOString(), cwd: "" },
+			leafId: entries.length > 0 ? entries[entries.length - 1].id : null,
+			entryIds: entries.map((e) => e.id),
+		};
+		this.writeManifest(sessionPath, manifest);
+	}
+
+	append(sessionPath: string, entry: SessionEntry): void {
+		writeFileSync(join(sessionPath, "entries", `${entry.id}.json`), JSON.stringify(entry));
+		const manifest = this.readManifest(sessionPath);
+		manifest.entryIds.push(entry.id);
+		manifest.leafId = entry.id;
+		this.writeManifest(sessionPath, manifest);
+	}
+
+	rewrite(sessionPath: string, allEntries: FileEntry[]): void {
+		const entriesDir = join(sessionPath, "entries");
+		if (existsSync(entriesDir)) {
+			for (const f of readdirSync(entriesDir)) {
+				unlinkSync(join(entriesDir, f));
+			}
+		}
+		this.flush(sessionPath, allEntries);
+	}
+
+	load(sessionPath: string): FileEntry[] {
+		const manifestPath = join(sessionPath, "manifest.json");
+		if (!existsSync(manifestPath)) return [];
+		try {
+			const manifest = this.readManifest(sessionPath);
+			if (!manifest.header?.id) return [];
+			const entriesDir = join(sessionPath, "entries");
+			const entries: SessionEntry[] = [];
+			for (const id of manifest.entryIds) {
+				const entryPath = join(entriesDir, `${id}.json`);
+				if (!existsSync(entryPath)) continue;
+				try {
+					entries.push(JSON.parse(readFileSync(entryPath, "utf8")) as SessionEntry);
+				} catch {
+					// skip corrupted entries
+				}
+			}
+			return [manifest.header, ...entries];
+		} catch {
+			return [];
+		}
+	}
+
+	exists(sessionPath: string): boolean {
+		return existsSync(join(sessionPath, "manifest.json"));
+	}
+
+	ensureDir(path: string): void {
+		if (!existsSync(path)) {
+			mkdirSync(path, { recursive: true });
+		}
+	}
+
+	generatePath(sessionDir: string, sessionId: string, _timestamp: string): string {
+		return join(sessionDir, sessionId);
+	}
+
+	findMostRecent(sessionDir: string, cwd?: string): string | null {
+		const resolvedCwd = cwd ? resolvePath(cwd) : undefined;
+		try {
+			const candidates = readdirSync(sessionDir, { withFileTypes: true })
+				.filter((e) => e.isDirectory())
+				.map((e) => join(sessionDir, e.name))
+				.filter((d) => existsSync(join(d, "manifest.json")))
+				.map((dirPath) => {
+					try {
+						const manifest = this.readManifest(dirPath);
+						if (!manifest.header?.id) return null;
+						if (resolvedCwd && !sessionCwdMatches(manifest.header.cwd, resolvedCwd)) return null;
+						const mtime = statSync(join(dirPath, "manifest.json")).mtime;
+						return { path: dirPath, mtime };
+					} catch {
+						return null;
+					}
+				})
+				.filter((c): c is { path: string; mtime: Date } => c !== null)
+				.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+			return candidates[0]?.path ?? null;
+		} catch {
+			return null;
+		}
+	}
+
+	async listSessions(sessionDir: string, onProgress?: SessionListProgress): Promise<SessionInfo[]> {
+		const sessions: SessionInfo[] = [];
+		if (!existsSync(sessionDir)) return sessions;
+		try {
+			const sessionDirs = (await readdir(sessionDir, { withFileTypes: true }))
+				.filter((e) => e.isDirectory())
+				.map((e) => join(sessionDir, e.name))
+				.filter((d) => existsSync(join(d, "manifest.json")));
+			const total = sessionDirs.length;
+			let loaded = 0;
+			const results = await buildMemfsSessionInfosWithConcurrency(sessionDirs, () => {
+				loaded++;
+				onProgress?.(loaded, total);
+			});
+			for (const info of results) {
+				if (info) sessions.push(info);
+			}
+		} catch {
+			// return empty list on error
+		}
+		return sessions;
+	}
+
+	async listAllSessions(baseDir: string, onProgress?: SessionListProgress): Promise<SessionInfo[]> {
+		try {
+			if (!existsSync(baseDir)) return [];
+			const cwsDirs = (await readdir(baseDir, { withFileTypes: true }))
+				.filter((e) => e.isDirectory())
+				.map((e) => join(baseDir, e.name));
+
+			let totalSessions = 0;
+			const allSessionDirGroups: string[][] = [];
+			for (const cwdDir of cwsDirs) {
+				try {
+					const sessionDirs = (await readdir(cwdDir, { withFileTypes: true }))
+						.filter((e) => e.isDirectory())
+						.map((e) => join(cwdDir, e.name))
+						.filter((d) => existsSync(join(d, "manifest.json")));
+					allSessionDirGroups.push(sessionDirs);
+					totalSessions += sessionDirs.length;
+				} catch {
+					allSessionDirGroups.push([]);
+				}
+			}
+
+			let loaded = 0;
+			const sessions: SessionInfo[] = [];
+			const allSessionDirs = allSessionDirGroups.flat();
+			const results = await buildMemfsSessionInfosWithConcurrency(allSessionDirs, () => {
+				loaded++;
+				onProgress?.(loaded, totalSessions);
+			});
+			for (const info of results) {
+				if (info) sessions.push(info);
+			}
+			return sessions;
+		} catch {
+			return [];
+		}
+	}
+}
+
+// =========================================================================
+// Active Provider
+// =========================================================================
+
+let _activePersistence: SessionPersistence = new JsonlSessionPersistence();
+
+function getActivePersistence(): SessionPersistence {
+	return _activePersistence;
+}
+
+/**
+ * Configure the active memory provider. Call before creating any SessionManager instances.
+ * - "default": JSONL append-only files (one file per session)
+ * - "memfs":   Letta MemFS directory layout (one directory per session, one file per entry)
+ *
+ * Switching providers does not migrate existing sessions; each provider reads only its own format.
+ * The MEMORY_PROVIDER environment variable overrides this call.
+ */
+export function configureMemoryProvider(provider: string): void {
+	if (provider === "memfs") {
+		_activePersistence = new MemfsSessionPersistence();
+	} else {
+		_activePersistence = new JsonlSessionPersistence();
+	}
+}
+
+// Auto-configure from MEMORY_PROVIDER env var if set at module load time.
+{
+	const envProvider = process.env["MEMORY_PROVIDER"];
+	if (envProvider) {
+		configureMemoryProvider(envProvider);
+	}
+}
+
 /**
  * Manages conversation sessions as append-only trees stored in JSONL files.
  *
@@ -767,6 +1224,7 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
+	private persistence: SessionPersistence;
 
 	private constructor(
 		cwd: string,
@@ -774,12 +1232,14 @@ export class SessionManager {
 		sessionFile: string | undefined,
 		persist: boolean,
 		newSessionOptions?: NewSessionOptions,
+		persistence: SessionPersistence = getActivePersistence(),
 	) {
 		this.cwd = resolvePath(cwd);
 		this.sessionDir = normalizePath(sessionDir);
 		this.persist = persist;
-		if (persist && this.sessionDir && !existsSync(this.sessionDir)) {
-			mkdirSync(this.sessionDir, { recursive: true });
+		this.persistence = persistence;
+		if (persist && this.sessionDir) {
+			this.persistence.ensureDir(this.sessionDir);
 		}
 
 		if (sessionFile) {
@@ -792,8 +1252,8 @@ export class SessionManager {
 	/** Switch to a different session file (used for resume and branching) */
 	setSessionFile(sessionFile: string): void {
 		this.sessionFile = resolvePath(sessionFile);
-		if (existsSync(this.sessionFile)) {
-			this.fileEntries = loadEntriesFromFile(this.sessionFile);
+		if (this.persistence.exists(this.sessionFile)) {
+			this.fileEntries = this.persistence.load(this.sessionFile);
 
 			// If file was empty or corrupted (no valid header), truncate and start fresh
 			// to avoid appending messages without a session header (which breaks the session)
@@ -843,8 +1303,7 @@ export class SessionManager {
 		this.flushed = false;
 
 		if (this.persist) {
-			const fileTimestamp = timestamp.replace(/[:.]/g, "-");
-			this.sessionFile = join(this.getSessionDir(), `${fileTimestamp}_${this.sessionId}.jsonl`);
+			this.sessionFile = this.persistence.generatePath(this.getSessionDir(), this.sessionId, timestamp);
 		}
 		return this.sessionFile;
 	}
@@ -872,14 +1331,7 @@ export class SessionManager {
 
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
-		const fd = openSync(this.sessionFile, "w");
-		try {
-			for (const entry of this.fileEntries) {
-				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
-			}
-		} finally {
-			closeSync(fd);
-		}
+		this.persistence.rewrite(this.sessionFile, this.fileEntries);
 	}
 
 	isPersisted(): boolean {
@@ -912,26 +1364,19 @@ export class SessionManager {
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
 		if (!hasAssistant) {
 			if (this.flushed) {
-				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+				this.persistence.append(this.sessionFile, entry);
 			} else {
-				// Mark as not flushed so when assistant arrives, all entries get written
+				// Buffer in memory until the first assistant message triggers a flush.
 				this.flushed = false;
 			}
 			return;
 		}
 
 		if (!this.flushed) {
-			const fd = openSync(this.sessionFile, "wx");
-			try {
-				for (const e of this.fileEntries) {
-					writeFileSync(fd, `${JSON.stringify(e)}\n`);
-				}
-			} finally {
-				closeSync(fd);
-			}
+			this.persistence.flush(this.sessionFile, this.fileEntries);
 			this.flushed = true;
 		} else {
-			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			this.persistence.append(this.sessionFile, entry);
 		}
 	}
 
@@ -1305,8 +1750,7 @@ export class SessionManager {
 
 		const newSessionId = createSessionId();
 		const timestamp = new Date().toISOString();
-		const fileTimestamp = timestamp.replace(/[:.]/g, "-");
-		const newSessionFile = join(this.getSessionDir(), `${fileTimestamp}_${newSessionId}.jsonl`);
+		const newSessionFile = this.persistence.generatePath(this.getSessionDir(), newSessionId, timestamp);
 
 		const header: SessionHeader = {
 			type: "session",
@@ -1394,7 +1838,8 @@ export class SessionManager {
 	 */
 	static create(cwd: string, sessionDir?: string, options?: NewSessionOptions): SessionManager {
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
-		return new SessionManager(cwd, dir, undefined, true, options);
+		const persistence = getActivePersistence();
+		return new SessionManager(cwd, dir, undefined, true, options, persistence);
 	}
 
 	/**
@@ -1405,13 +1850,14 @@ export class SessionManager {
 	 */
 	static open(path: string, sessionDir?: string, cwdOverride?: string): SessionManager {
 		const resolvedPath = resolvePath(path);
+		const persistence = getActivePersistence();
 		// Extract cwd from session header if possible, otherwise use process.cwd()
-		const entries = loadEntriesFromFile(resolvedPath);
+		const entries = persistence.load(resolvedPath);
 		const header = entries.find((e) => e.type === "session") as SessionHeader | undefined;
 		const cwd = cwdOverride ?? header?.cwd ?? process.cwd();
-		// If no sessionDir provided, derive from file's parent directory
+		// If no sessionDir provided, derive from path's parent directory
 		const dir = sessionDir ? normalizePath(sessionDir) : resolve(resolvedPath, "..");
-		return new SessionManager(cwd, dir, resolvedPath, true);
+		return new SessionManager(cwd, dir, resolvedPath, true, undefined, persistence);
 	}
 
 	/**
@@ -1422,16 +1868,17 @@ export class SessionManager {
 	static continueRecent(cwd: string, sessionDir?: string): SessionManager {
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
 		const filterCwd = sessionDir !== undefined && dir !== getDefaultSessionDirPath(cwd);
-		const mostRecent = findMostRecentSession(dir, filterCwd ? cwd : undefined);
+		const persistence = getActivePersistence();
+		const mostRecent = persistence.findMostRecent(dir, filterCwd ? cwd : undefined);
 		if (mostRecent) {
-			return new SessionManager(cwd, dir, mostRecent, true);
+			return new SessionManager(cwd, dir, mostRecent, true, undefined, persistence);
 		}
-		return new SessionManager(cwd, dir, undefined, true);
+		return new SessionManager(cwd, dir, undefined, true, undefined, persistence);
 	}
 
 	/** Create an in-memory session (no file persistence) */
 	static inMemory(cwd: string = process.cwd()): SessionManager {
-		return new SessionManager(cwd, "", undefined, false);
+		return new SessionManager(cwd, "", undefined, false, undefined, getActivePersistence());
 	}
 
 	/**
@@ -1447,11 +1894,12 @@ export class SessionManager {
 		sessionDir?: string,
 		options?: NewSessionOptions,
 	): SessionManager {
+		const persistence = getActivePersistence();
 		const resolvedSourcePath = resolvePath(sourcePath);
 		const resolvedTargetCwd = resolvePath(targetCwd);
-		const sourceEntries = loadEntriesFromFile(resolvedSourcePath);
+		const sourceEntries = persistence.load(resolvedSourcePath);
 		if (sourceEntries.length === 0) {
-			throw new Error(`Cannot fork: source session file is empty or invalid: ${resolvedSourcePath}`);
+			throw new Error(`Cannot fork: source session is empty or invalid: ${resolvedSourcePath}`);
 		}
 
 		const sourceHeader = sourceEntries.find((e) => e.type === "session") as SessionHeader | undefined;
@@ -1460,20 +1908,15 @@ export class SessionManager {
 		}
 
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(resolvedTargetCwd);
-		if (!existsSync(dir)) {
-			mkdirSync(dir, { recursive: true });
-		}
+		persistence.ensureDir(dir);
 
-		// Create new session file with new ID but forked content
 		if (options?.id !== undefined) {
 			assertValidSessionId(options.id);
 		}
 		const newSessionId = options?.id ?? createSessionId();
 		const timestamp = new Date().toISOString();
-		const fileTimestamp = timestamp.replace(/[:.]/g, "-");
-		const newSessionFile = join(dir, `${fileTimestamp}_${newSessionId}.jsonl`);
+		const newPath = persistence.generatePath(dir, newSessionId, timestamp);
 
-		// Write new header pointing to source as parent, with updated cwd
 		const newHeader: SessionHeader = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
@@ -1482,16 +1925,11 @@ export class SessionManager {
 			cwd: resolvedTargetCwd,
 			parentSession: resolvedSourcePath,
 		};
-		writeFileSync(newSessionFile, `${JSON.stringify(newHeader)}\n`, { flag: "wx" });
 
-		// Copy all non-header entries from source
-		for (const entry of sourceEntries) {
-			if (entry.type !== "session") {
-				appendFileSync(newSessionFile, `${JSON.stringify(entry)}\n`);
-			}
-		}
+		const nonHeaderEntries = sourceEntries.filter((e): e is SessionEntry => e.type !== "session");
+		persistence.flush(newPath, [newHeader, ...nonHeaderEntries]);
 
-		return new SessionManager(resolvedTargetCwd, dir, newSessionFile, true);
+		return new SessionManager(resolvedTargetCwd, dir, newPath, true, undefined, persistence);
 	}
 
 	/**
@@ -1504,7 +1942,7 @@ export class SessionManager {
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
 		const filterCwd = sessionDir !== undefined && dir !== getDefaultSessionDirPath(cwd);
 		const resolvedCwd = resolvePath(cwd);
-		const sessions = (await listSessionsFromDir(dir, onProgress)).filter(
+		const sessions = (await getActivePersistence().listSessions(dir, onProgress)).filter(
 			(session) => !filterCwd || sessionCwdMatches(session.cwd, resolvedCwd),
 		);
 		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
@@ -1524,50 +1962,16 @@ export class SessionManager {
 		const customSessionDir =
 			typeof sessionDirOrOnProgress === "string" ? normalizePath(sessionDirOrOnProgress) : undefined;
 		const progress = typeof sessionDirOrOnProgress === "function" ? sessionDirOrOnProgress : onProgress;
+		const persistence = getActivePersistence();
+
 		if (customSessionDir) {
-			const sessions = await listSessionsFromDir(customSessionDir, progress);
+			const sessions = await persistence.listSessions(customSessionDir, progress);
 			sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 			return sessions;
 		}
 
-		const sessionsDir = getSessionsDir();
-
 		try {
-			if (!existsSync(sessionsDir)) {
-				return [];
-			}
-			const entries = await readdir(sessionsDir, { withFileTypes: true });
-			const dirs = entries.filter((e) => e.isDirectory()).map((e) => join(sessionsDir, e.name));
-
-			// Count total files first for accurate progress
-			let totalFiles = 0;
-			const dirFiles: string[][] = [];
-			for (const dir of dirs) {
-				try {
-					const files = (await readdir(dir)).filter((f) => f.endsWith(".jsonl"));
-					dirFiles.push(files.map((f) => join(dir, f)));
-					totalFiles += files.length;
-				} catch {
-					dirFiles.push([]);
-				}
-			}
-
-			// Process all files with progress tracking
-			let loaded = 0;
-			const sessions: SessionInfo[] = [];
-			const allFiles = dirFiles.flat();
-
-			const results = await buildSessionInfosWithConcurrency(allFiles, () => {
-				loaded++;
-				progress?.(loaded, totalFiles);
-			});
-
-			for (const info of results) {
-				if (info) {
-					sessions.push(info);
-				}
-			}
-
+			const sessions = await persistence.listAllSessions(getSessionsDir(), progress);
 			sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 			return sessions;
 		} catch {
